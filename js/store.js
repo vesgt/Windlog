@@ -29,8 +29,27 @@ export function save(data) {
   localStorage.setItem(KEY, JSON.stringify(data));
 }
 
-export function resetSeed() { const d = fresh(); save(d); return d; }
+const META_KEY = "windlog.v1.meta";       // { lastExport }
+const SNAP_KEY = "windlog.v1.prewipe";     // pre-destructive snapshot for undo
+
+function meta() { try { return JSON.parse(localStorage.getItem(META_KEY)) || {}; } catch { return {}; } }
+export function lastExport() { return meta().lastExport || null; }
+export function markExported() {
+  const m = meta(); m.lastExport = new Date().toISOString();
+  localStorage.setItem(META_KEY, JSON.stringify(m));
+}
+// stash current data before a wipe/reset so it can be restored
+function snapshot() { const raw = localStorage.getItem(KEY); if (raw) localStorage.setItem(SNAP_KEY, raw); }
+export function hasSnapshot() { return !!localStorage.getItem(SNAP_KEY); }
+export function restoreSnapshot() {
+  const raw = localStorage.getItem(SNAP_KEY); if (!raw) return null;
+  localStorage.setItem(KEY, raw); localStorage.removeItem(SNAP_KEY);
+  return load();
+}
+
+export function resetSeed() { snapshot(); const d = fresh(); save(d); return d; }
 export function wipe() {
+  snapshot();
   const d = { config: structuredClone(DEFAULT_CONFIG), forecasts: [], observations: [], sessions: [] };
   save(d); return d;
 }
@@ -67,7 +86,7 @@ function toCSV(rows, fields) {
 }
 
 export const CSV_FIELDS = {
-  sessions: ["session_id","date","spot","sailor","weight_kg","board","sail","fin_cm","time_start","time_end","max_speed_kt","mins_planing","powered","planed","sky","air_t","water_t","notes"],
+  sessions: ["session_id","date","spot","sailor","weight_kg","board","sail","fin_cm","time_start","time_end","max_speed_kt","mins_planing","planing_ratio","tacks_tried","tacks_made","jibes_tried","jibes_made","powered","planed","sky","air_t","water_t","notes"],
   forecasts: ["session_id","model","base_ms","gust_ms","dir","captured_at","source"],
   observations: ["session_id","station_id","station_name","obs_base_ms","obs_gust_ms","obs_dir","fetched_at"],
 };

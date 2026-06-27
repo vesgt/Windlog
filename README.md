@@ -36,22 +36,29 @@ full-screen, works offline for everything except FIT parsing and SMHI fetch
 
 ## The four tabs
 
-**Today** — type the forecast you trust (after weighting models — SMHI &
-PredictWind P_E win locally, discount GFS gusts). You get the wind on the
-colour scale you already read, gear for both sailors, and the spot for the
-direction. If you've logged enough sessions it also shows your *measured*
-planing floor and whether today clears it.
+**Today** — opens and **auto-polls live wind for every spot** (YR/MET Norway,
+ECMWF, GFS, ICON via Open-Meteo — no key, no typing) plus a refresh button. Tap
+a spot to load its **reliability-weighted blended call**, or override the number
+by hand. You get the wind on the colour scale you already read, gear for both
+sailors (now including the **Old Mistral** floater on the lightest days), and
+the spot for the direction. Every poll quietly logs each model's forecast so the
+trust scores build themselves. If you've logged enough sessions it also shows
+your *measured* planing floor and whether today clears it.
 
 **Log** — record a session. Drop in your Garmin `.fit` and it fills max speed
 and planing minutes automatically; tick "Pull SMHI" and it grabs the nearest
 station's measured wind as ground truth. One entry per sailor.
 
-**Stats** — model reliability per spot (forecast vs measured), best model
-flagged, plus your planing thresholds per board+sail as they accumulate.
+**Stats** — a **0–100 trust score** per model per spot with a plain-language
+read on how it's wrong ("GFS over-reads gusts by 4.2 m/s"), best model flagged,
+the detailed bias/error table underneath, plus your planing thresholds per
+board+sail as they accumulate.
 
-**Data** — add forecast rows before a session, browse/delete sessions, and
-**export JSON or CSV**. The CSVs match the earlier Python toolkit's schema, so
-both systems read the same data.
+**Data** — add forecast rows by hand, or use the **PredictWind** card: drop in a
+screenshot and in-browser OCR pre-fills the 4-model grid (check the numbers, it's
+best-effort), or just type the rows. Each model saves separately so it earns its
+own trust score. Browse/delete sessions and **export JSON or CSV**. The CSVs
+match the earlier Python toolkit's schema, so both systems read the same data.
 
 ---
 
@@ -97,5 +104,7 @@ js/
   store.js              localStorage + CSV/JSON export & import
   config.js             your quiver, sailors, spots (+ seed data)
   fit.js                Garmin .fit → max speed, planing minutes
-  smhi.js               nearest SMHI station → measured wind
+  smhi.js               nearest SMHI station → measured wind (ground truth)
+  forecast.js           Open-Meteo multi-model auto-poll (YR/ECMWF/GFS/ICON)
+  ocr.js                PredictWind screenshot → grid (Tesseract.js, lazy CDN)
 ```

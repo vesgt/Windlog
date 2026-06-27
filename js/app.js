@@ -3,6 +3,8 @@ import * as store from "./store.js";
 import * as engine from "./engine.js";
 import { parseFit } from "./fit.js";
 import { fetchObservation } from "./smhi.js";
+import { fetchAllSpots, consensus, bestWindow } from "./forecast.js";
+import { recognize, parsePredictWind } from "./ocr.js";
 
 let data = store.load();
 const $ = (s, r = document) => r.querySelector(s);
@@ -21,19 +23,101 @@ function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.ad
 
 // ── TODAY ─────────────────────────────────────────────
 const today = { base: 6, gust: 11, dir: "S" };
+let liveForecasts = null;     // { spotKey: { models:[...], fetched_at, error? } }
+let liveBusy = false;
+const ALL_DIRS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+
+// weights per spot from the reliability track record, for the blended call
+function weightsForSpot(spotKey) {
+  const rel = engine.modelReliability(data.forecasts, data.observations);
+  return engine.modelWeights(rel[spotKey]);
+}
+
+// a spot's live models with each one's learned bias subtracted out
+function liveModels(spotKey) {
+  const f = liveForecasts?.[spotKey];
+  if (!f || f.error || !f.models?.length) return [];
+  const rel = engine.modelReliability(data.forecasts, data.observations);
+  return engine.biasCorrect(f.models, rel[spotKey]);
+}
+
+// Write the freshly-polled models into the forecast log so reliability builds
+// itself with no typing. One auto row per model per spot per day; manual rows
+// and PredictWind rows are left untouched.
+function captureForecasts(bySpot, dayISO) {
+  for (const [spotKey, f] of Object.entries(bySpot)) {
+    if (!f || f.error || !f.models?.length) continue;
+    const sid = store.sessionId(dayISO, spotKey);
+    for (const m of f.models) {
+      const existing = data.forecasts.find((r) => r.session_id === sid && r.model === m.model);
+      if (existing && existing.source !== "auto") continue;   // never clobber manual/PW
+      store.upsertForecast(data, { session_id: sid, model: m.model, base_ms: m.base_ms,
+        gust_ms: m.gust_ms, dir: m.dir, captured_at: f.fetched_at, source: "auto" });
+    }
+  }
+}
+
+async function pollForecasts(force) {
+  if (liveBusy) return;
+  liveBusy = true;
+  const day = new Date().toISOString().slice(0, 10);
+  try {
+    liveForecasts = await fetchAllSpots(data.config.spots, { force });
+    captureForecasts(liveForecasts, day);
+  } catch { /* leave whatever we had */ }
+  liveBusy = false;
+}
+
+// Rank spots by today's blended call: direction-matched + windiest first, each
+// scored go/no-go per sailor against their learned floor, with the best window.
+function rankSpots() {
+  if (!liveForecasts) return [];
+  const floors = engine.learnedFloors(data.sessions, data.observations);
+  const rows = [];
+  for (const [key, sp] of Object.entries(data.config.spots)) {
+    const f = liveForecasts[key];
+    if (!f || f.error || !f.models?.length) continue;
+    const models = liveModels(key);
+    const c = consensus(models, weightsForSpot(key));
+    if (!c || c.base_ms == null) continue;
+    const baseKt = c.base_ms * engine.MS_TO_KT;
+    const dirMatch = !!sp.good_dirs?.includes((c.dir || "").toUpperCase());
+    const sailors = Object.entries(data.config.sailors).map(([who, s]) => ({
+      name: s.name, gng: engine.goNoGo(baseKt, floors[who]) }));
+    rows.push({ key, sp, c, baseKt, dirMatch, hourly: f.hourly || [],
+      corrected: models.some((m) => m.corrected),
+      window: bestWindow(f.hourly), agree: engine.modelAgreement(models), sailors });
+  }
+  rows.sort((a, b) => (b.dirMatch - a.dirMatch) || (b.baseKt - a.baseKt));
+  return rows;
+}
+
+const GNG_CLASS = { "GO": "matched", "MARGINAL": "marginal", "NO-GO": "under" };
 function renderToday() {
   const v = $("#view-today"); v.innerHTML = "";
+
+  // best-spot-now banner
+  const banner = el("div", "card banner"); banner.id = "t-banner";
+  v.appendChild(banner);
+  renderBanner();
+
+  // live multi-model forecast per spot, with the blended call
+  const live = el("div", "card");
+  live.id = "t-live";
+  v.appendChild(live);
+  renderLive();
+
   const inp = el("div", "card");
   inp.innerHTML = `
-    <h2 class="section" style="margin-top:0">Forecast you trust</h2>
+    <details ${liveForecasts ? "" : "open"}><summary class="section" style="margin:0;cursor:pointer">Override the call</summary>
+    <div class="hint" style="margin:8px 0">Tap a spot above to load its blended forecast, or set the number you'd actually bet on.</div>
     <div class="row">
       <label class="fld"><span class="lab">Base m/s</span><input class="num" id="t-base" type="number" inputmode="decimal" step="0.5" value="${today.base}"></label>
       <label class="fld"><span class="lab">Gust m/s</span><input class="num" id="t-gust" type="number" inputmode="decimal" step="0.5" value="${today.gust}"></label>
     </div>
     <label class="fld"><span class="lab">Direction</span>
-      <select class="num" id="t-dir">${["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"].map(d=>`<option ${d===today.dir?"selected":""}>${d}</option>`).join("")}</select>
-    </label>
-    <div class="hint">Weight the models first — SMHI & PredictWind P_E tend to win locally; discount GFS gusts. Enter the number you'd actually bet on.</div>`;
+      <select class="num" id="t-dir">${ALL_DIRS.map(d=>`<option ${d===today.dir?"selected":""}>${d}</option>`).join("")}</select>
+    </label></details>`;
   v.appendChild(inp);
   const out = el("div"); out.id = "t-out"; v.appendChild(out);
   const recompute = () => {
@@ -44,6 +128,124 @@ function renderToday() {
   };
   $("#t-base").oninput = recompute; $("#t-gust").oninput = recompute; $("#t-dir").onchange = recompute;
   recompute();
+
+  // first paint: if we have nothing yet, fetch and re-render
+  if (!liveForecasts) pollForecasts(false).then(() => { if (currentTab === "today") renderToday(); });
+}
+
+// set the trusted call from a spot's blended forecast and refresh inputs
+function useSpot(spotKey) {
+  const models = liveModels(spotKey);
+  if (!models.length) return;
+  const c = consensus(models, weightsForSpot(spotKey));
+  if (!c) return;
+  if (c.base_ms != null) today.base = c.base_ms;
+  if (c.gust_ms != null) today.gust = c.gust_ms;
+  if (c.dir) today.dir = c.dir;
+  renderToday();
+}
+
+// Compact hourly wind timeline: base as a coloured bar, gust as a faint cap,
+// the best window highlighted. Pure inline markup, no chart lib.
+function sparkline(hourly, win) {
+  if (!hourly || hourly.length < 2) return "";
+  const top = Math.max(15, ...hourly.map((p) => p.gust_ms || 0));
+  const bars = hourly.map((p) => {
+    const inWin = win && p.h >= win.from && p.h <= win.to;
+    const bh = Math.round(((p.base_ms || 0) / top) * 100);
+    const gh = Math.round(((p.gust_ms || 0) / top) * 100);
+    const kt = (p.base_ms || 0) * KT;
+    return `<div class="spk-col${inWin ? " win" : ""}" title="${p.h}:00 — ${p.base_ms}/${p.gust_ms} m/s ${p.dir||""}">
+      <div class="spk-gust" style="height:${gh}%"></div>
+      <div class="spk-base" style="height:${bh}%;background:${windColor(kt)}"></div></div>`;
+  }).join("");
+  const first = hourly[0].h, last = hourly[hourly.length - 1].h;
+  return `<div class="spark"><div class="spk-bars">${bars}</div>
+    <div class="spk-axis"><span>${first}:00</span><span>${last}:00</span></div></div>`;
+}
+
+// One-line read on whether today favours one sailor over the other.
+function whoseDayLine(sailors) {
+  const rank = { "GO": 2, "MARGINAL": 1, "NO-GO": 0 };
+  const known = sailors.filter((s) => s.gng);
+  if (known.length < 2) return "";
+  const [a, b] = known;
+  if (rank[a.gng] === rank[b.gng]) {
+    if (a.gng === "GO") return "🌬️ On for you both.";
+    if (a.gng === "NO-GO") return "Too light for either of you right now.";
+    return "Marginal for you both — gust-dependent.";
+  }
+  const hi = rank[a.gng] > rank[b.gng] ? a : b, lo = hi === a ? b : a;
+  return `Better day for <b>${hi.name}</b> (${hi.gng}) than ${lo.name} (${lo.gng}).`;
+}
+
+function renderBanner() {
+  const box = $("#t-banner"); if (!box) return;
+  if (!liveForecasts) {
+    box.innerHTML = `<div class="hint" style="margin:0">Fetching the call for every spot…</div>`;
+    return;
+  }
+  const ranked = rankSpots();
+  if (!ranked.length) {
+    box.innerHTML = `<div class="hint" style="margin:0">No live wind yet — tap ⟳ below, or set the call by hand.</div>`;
+    return;
+  }
+  const top = ranked[0];
+  const win = top.window;
+  const winTxt = win ? `best window <b>${String(win.from).padStart(2,"0")}–${String(win.to).padStart(2,"0")}h</b> (${win.avgBase} m/s)` : "";
+  const agreeTxt = top.agree.spreadKt == null ? "" :
+    `<span class="agree ${top.agree.level}">models ${top.agree.level}${top.agree.level!=="solid"?` ±${top.agree.spreadKt}kt`:""}</span>`;
+  const sailorChips = top.sailors.filter((s) => s.gng).map((s) =>
+    `<span class="gng ${GNG_CLASS[s.gng]}">${s.name}: ${s.gng}</span>`).join("");
+  const whose = whoseDayLine(top.sailors);
+  const corr = top.corrected ? `<span class="agree solid" title="adjusted using your logged reliability">bias-corrected</span>` : "";
+  box.innerHTML = `
+    <div class="banner-head"><span class="kick">Best right now</span>${agreeTxt}${corr}</div>
+    <div class="banner-spot">${top.sp.name} <span class="bw">${top.c.base_ms}–${top.c.gust_ms} m/s ${top.c.dir||""}</span></div>
+    <div class="banner-sub">${top.dirMatch ? "✓ direction suits this spot" : "⚠︎ direction is off for all spots — best of a bad set"}${winTxt ? " · "+winTxt : ""}</div>
+    ${sparkline(top.hourly, top.window)}
+    ${sailorChips ? `<div class="banner-chips">${sailorChips}</div>` : `<div class="hint" style="margin:6px 0 0">Log sessions with SMHI wind to unlock GO/NO-GO per sailor.</div>`}
+    ${whose ? `<div class="whose">${whose}</div>` : ""}
+    <button class="btn sm ghost" id="t-banner-use" style="width:auto;margin-top:10px;padding:5px 14px">Use this call</button>`;
+  $("#t-banner-use").onclick = () => useSpot(top.key);
+}
+
+function renderLive() {
+  const box = $("#t-live"); if (!box) return;
+  const spots = data.config.spots;
+  const updated = liveForecasts ? Object.values(liveForecasts).find((f) => f && f.fetched_at)?.fetched_at : null;
+  box.innerHTML = `<div class="row" style="align-items:center;justify-content:space-between">
+      <h2 class="section" style="margin:0">Live forecast</h2>
+      <button class="icon-btn" id="t-refresh" title="Refresh" aria-label="Refresh forecasts">${liveBusy ? "…" : "⟳"}</button>
+    </div>
+    <div class="hint" style="margin:4px 0 10px">${liveBusy ? "Fetching YR · ECMWF · GFS · ICON…" : updated ? `Auto-polled · ${updated.replace("T"," ")} · tap a spot to use it` : "Open to fetch — YR, ECMWF, GFS, ICON per spot"}</div>`;
+  if (liveForecasts) {
+    Object.entries(spots).forEach(([key, sp], i) => {
+      const f = liveForecasts[key];
+      if (i) box.appendChild(el("div", "divider"));
+      const card = el("div", "spotlive");
+      if (!f || f.error || !f.models.length) {
+        card.innerHTML = `<div class="nm">${sp.name}</div><div class="hint">${f?.error ? "fetch blocked — "+f.error : "no data"}</div>`;
+      } else {
+        const models = liveModels(key);
+        const c = consensus(models, weightsForSpot(key));
+        const anyCorr = models.some((m) => m.corrected);
+        const rows = models.map((m) => `<tr><td>${m.model}${m.corrected ? '<span class="corr">•</span>' : ""}</td><td>${m.base_ms ?? "–"}</td><td>${m.gust_ms ?? "–"}</td><td>${m.dir || "–"}</td></tr>`).join("");
+        const ck = c ? `${c.base_ms ?? "–"}–${c.gust_ms ?? "–"} m/s ${c.dir || ""}` : "–";
+        card.innerHTML = `
+          <div class="row" style="align-items:baseline;justify-content:space-between">
+            <div class="nm">${sp.name}</div>
+            <button class="btn sm ghost" data-spot="${key}" style="width:auto;padding:4px 12px">Use · ${ck}</button>
+          </div>
+          <table class="tbl"><thead><tr><th>model</th><th>base</th><th>gust</th><th>dir</th></tr></thead><tbody>${rows}</tbody></table>
+          ${anyCorr ? '<div class="hint" style="margin-top:6px">• adjusted from your logged reliability</div>' : ""}`;
+      }
+      box.appendChild(card);
+    });
+  }
+  const rb = $("#t-refresh");
+  if (rb) rb.onclick = async () => { await pollForecasts(true); renderToday(); };
+  box.querySelectorAll("[data-spot]").forEach((b) => b.onclick = () => useSpot(b.dataset.spot));
 }
 function renderRecommendation(out) {
   const floors = engine.learnedFloors(data.sessions, data.observations);
@@ -85,6 +287,29 @@ function renderRecommendation(out) {
     });
   } else sc.appendChild(el("div", "hint", `No configured spot faces ${r.dir}. Add one in Setup.`));
   out.appendChild(sc);
+
+  const drill = engine.drillOfTheDay(r.baseKt, r.gustKt);
+  if (drill) {
+    const dc = el("div", "card drillcard");
+    dc.innerHTML = `<div class="kick">Drill today</div><div class="drill-t">${drill.title}</div><div class="drill-d">${drill.detail}</div>`;
+    out.appendChild(dc);
+  }
+
+  // what-if: every sail at this wind, per sailor
+  const wc = el("div", "card");
+  const cls = (p) => p.includes("matched") ? "matched" : p.startsWith("over") ? "over" : p.startsWith("marginal") ? "marginal" : "under";
+  const sailorIds = Object.keys(data.config.sailors);
+  const headCells = sailorIds.map((w) => `<th>${data.config.sailors[w].name}</th>`).join("");
+  const rows = [...data.config.sails].sort((a, b) => b - a).map((sail) => {
+    const cells = sailorIds.map((w) => {
+      const p = engine.powerNote(today.base, today.gust, sail, data.config.sailors[w].weight_kg);
+      return `<td><span class="power ${cls(p)} mini">${p}</span></td>`;
+    }).join("");
+    return `<tr><td>${sail} m²</td>${cells}</tr>`;
+  }).join("");
+  wc.innerHTML = `<details><summary class="section" style="margin:0;cursor:pointer">What-if — every sail at this wind</summary>
+    <table class="tbl whatif" style="margin-top:10px"><thead><tr><th>sail</th>${headCells}</tr></thead><tbody>${rows}</tbody></table></details>`;
+  out.appendChild(wc);
 }
 
 // ── LOG ───────────────────────────────────────────────
@@ -120,6 +345,15 @@ function renderLog() {
       <label class="fld"><span class="lab">Max speed kt</span><input class="num" id="l-max" type="number" inputmode="decimal" step="0.1" placeholder="—"></label>
       <label class="fld"><span class="lab">Planing min</span><input class="num" id="l-plan" type="number" inputmode="decimal" placeholder="—"></label>
     </div>
+    <div class="seg-lab">Tacks &amp; jibes — made / tried</div>
+    <div class="row">
+      <label class="fld"><span class="lab">Tacks made</span><input class="num" id="l-tm" type="number" inputmode="numeric" min="0" placeholder="0"></label>
+      <label class="fld"><span class="lab">Tacks tried</span><input class="num" id="l-tt" type="number" inputmode="numeric" min="0" placeholder="0"></label>
+    </div>
+    <div class="row">
+      <label class="fld"><span class="lab">Jibes made</span><input class="num" id="l-jm" type="number" inputmode="numeric" min="0" placeholder="0"></label>
+      <label class="fld"><span class="lab">Jibes tried</span><input class="num" id="l-jt" type="number" inputmode="numeric" min="0" placeholder="0"></label>
+    </div>
     <label class="fld"><span class="lab">Notes</span><textarea id="l-notes" placeholder="anything worth remembering"></textarea></label>
     <label class="fld"><input id="l-smhi" type="checkbox" style="width:auto;margin-right:8px" checked>Pull SMHI measured wind for the session window</label>
     <button class="btn" id="l-save">Log session</button>
@@ -144,7 +378,12 @@ async function onFitPick(e) {
     $("#l-max").value = m.max_speed_kt; $("#l-plan").value = m.mins_planing;
     if (m.startMs) { $("#l-start").value = hhmm(m.startMs); $("#l-end").value = hhmm(m.endMs); $("#l-times").style.opacity = .5; }
     const ratioTxt = m.planing_ratio != null ? `, planing ${Math.round(m.planing_ratio*100)}% of moving time` : "";
-    out.innerHTML = `<div class="filechip">✓ ${f.name} — max ${m.max_speed_kt} kt${ratioTxt}</div>`;
+    // auto-pick the spot from the FIT's GPS
+    let spotTxt = "";
+    const near = engine.nearestSpot(m.lat, m.lon, data.config.spots);
+    if (near) { $("#l-spot").value = near.key; spotTxt = ` · ${near.spot.name} (${near.km} km from GPS)`; }
+    else if (m.lat != null) spotTxt = " · GPS didn't match a known spot — pick it manually";
+    out.innerHTML = `<div class="filechip">✓ ${f.name} — max ${m.max_speed_kt} kt${ratioTxt}${spotTxt}</div>`;
     // provisional assessment (wind pending)
     const prov = engine.assessSession({ planingRatio: m.planing_ratio, baseKt: null, gustKt: null, sail: parseFloat($("#l-sail").value), weight: data.config.sailors[logForm.sailor].weight_kg });
     showAssess(prov, true);
@@ -180,6 +419,9 @@ async function saveSession() {
     board: $("#l-board").value, sail: parseFloat($("#l-sail").value), fin_cm: "",
     time_start: win.startMs ? hhmm(win.startMs) : "", time_end: win.endMs ? hhmm(win.endMs) : "",
     max_speed_kt: $("#l-max").value, mins_planing: $("#l-plan").value,
+    planing_ratio: lastFit && lastFit.planing_ratio != null ? lastFit.planing_ratio : "",
+    tacks_tried: $("#l-tt").value, tacks_made: $("#l-tm").value,
+    jibes_tried: $("#l-jt").value, jibes_made: $("#l-jm").value,
     powered: "", planed: "", sky: "", air_t: "", water_t: "", notes: $("#l-notes").value,
   };
   store.addSession(data, row); // pushes by reference; we finalise powered/planed below
@@ -209,6 +451,23 @@ async function saveSession() {
 }
 
 // ── STATS ─────────────────────────────────────────────
+// Plain-language read on a model's error: how far off and which way.
+function howWrong(m) {
+  const dir = (x) => (x > 0 ? "over-reads" : "under-reads");
+  const parts = [];
+  if (m.baseMAE != null) {
+    parts.push(m.baseMAE < 1
+      ? `nails the base (±${m.baseMAE.toFixed(1)})`
+      : `${dir(m.baseBias)} base by ${Math.abs(m.baseBias).toFixed(1)} m/s`);
+  }
+  if (m.gustMAE != null) {
+    parts.push(m.gustMAE < 1.5
+      ? `gusts close (±${m.gustMAE.toFixed(1)})`
+      : `${dir(m.gustBias)} gusts by ${Math.abs(m.gustBias).toFixed(1)} m/s`);
+  }
+  return parts.join(" · ") || "not enough matched days yet";
+}
+
 function renderStats() {
   const v = $("#view-stats"); v.innerHTML = "";
   const rel = engine.modelReliability(data.forecasts, data.observations);
@@ -220,7 +479,20 @@ function renderStats() {
     relCard.appendChild(el("div", "empty", `<b>No matched pairs yet</b>Log a session with SMHI wind, and the models you entered for that day get scored against what actually blew.`));
   } else {
     for (const spot of spots) {
-      relCard.appendChild(el("div", "hint", `<b style="color:var(--text)">${spot}</b> — forecast minus measured (m/s); +hot, −cold`));
+      const spotName = data.config.spots[spot]?.name || spot;
+      relCard.appendChild(el("div", "hint", `<b style="color:var(--text)">${spotName}</b> — ranked by trust; how wrong each runs vs SMHI measured`));
+      // headline: trust score + plain-language error per model
+      rel[spot].forEach((m, i) => {
+        const trust = engine.trustScore(m);
+        const row = el("div", "trustrow");
+        row.innerHTML = `
+          <div class="tr-head"><b class="${i===0?"win":""}">${m.model}</b>
+            <span class="tr-score">${trust}<span class="u">/100</span></span></div>
+          <div class="tr-bar-track"><div class="tr-bar" style="width:${trust}%"></div></div>
+          <div class="tr-say">${howWrong(m)} <span class="sm">· ${m.n} day${m.n>1?"s":""}</span></div>`;
+        relCard.appendChild(row);
+      });
+      relCard.appendChild(el("div", "hint", `Detail — forecast minus measured (m/s); +over-reads, −under-reads`));
       const t = el("table", "tbl");
       t.innerHTML = `<thead><tr><th>Model</th><th>base bias</th><th>base err</th><th>gust bias</th><th>gust err</th><th>n</th></tr></thead>`;
       const tb = el("tbody");
@@ -250,6 +522,106 @@ function renderStats() {
     thrCard.appendChild(el("div", "hint", "Planing floor uses SMHI measured base wind. Fetch it when you log to anchor these."));
   }
   v.appendChild(thrCard);
+
+  // progression: planing-% trend + tack/jibe success per sailor
+  const trend = engine.planingTrend(data.sessions);
+  const rates = engine.skillRates(data.sessions);
+  const sailorsWithData = new Set([...Object.keys(trend), ...Object.keys(rates).filter((k) => {
+    const r = rates[k]; return r.tacksTried || r.jibesTried; })]);
+  const progCard = el("div", "card");
+  progCard.innerHTML = `<h2 class="section" style="margin-top:0">Progression</h2>`;
+  if (!sailorsWithData.size) {
+    progCard.appendChild(el("div", "empty", `<b>No progress data yet</b>Log sessions with a FIT (planing %) and your tack/jibe counts — your curve shows up here.`));
+  } else {
+    for (const who of sailorsWithData) {
+      const name = data.config.sailors[who]?.name || who;
+      const hist = trend[who] || [];
+      const r = rates[who] || {};
+      const pct = (m, t) => (t ? Math.round((m / t) * 100) + "%" : "—");
+      const last = hist.length ? Math.round(hist[hist.length - 1].ratio * 100) : null;
+      const first = hist.length ? Math.round(hist[0].ratio * 100) : null;
+      const arrow = last != null && first != null && hist.length > 1 ? (last > first ? `↑ ${first}→${last}%` : last < first ? `↓ ${first}→${last}%` : `${last}%`) : last != null ? `${last}%` : "";
+      progCard.appendChild(el("div", "progrow", `
+        <div class="prog-head"><b>${name}</b>${last != null ? `<span class="prog-now">planing ${last}% <span class="sm">${arrow !== `${last}%` ? arrow : "latest"}</span></span>` : ""}</div>
+        ${ratioSpark(hist)}
+        <div class="prog-skills"><span>tacks <b>${pct(r.tacksMade, r.tacksTried)}</b> <span class="sm">${r.tacksMade||0}/${r.tacksTried||0}</span></span><span>jibes <b>${pct(r.jibesMade, r.jibesTried)}</b> <span class="sm">${r.jibesMade||0}/${r.jibesTried||0}</span></span></div>`));
+    }
+    progCard.appendChild(el("div", "hint", "Planing % is your share of moving time on the plane (from the FIT). Tack/jibe rates are made ÷ tried across all sessions."));
+  }
+  v.appendChild(progCard);
+}
+
+// little bar trend of planing ratio over sessions
+function ratioSpark(hist) {
+  if (!hist || hist.length < 2) return hist && hist.length === 1 ? "" : "";
+  const bars = hist.slice(-16).map((p) => {
+    const h = Math.round(Math.max(0, Math.min(1, p.ratio)) * 100);
+    return `<div class="rs-col" title="${p.date} — ${Math.round(p.ratio*100)}%"><div class="rs-bar" style="height:${h}%"></div></div>`;
+  }).join("");
+  return `<div class="ratiospark">${bars}</div>`;
+}
+
+// ── PredictWind grid (OCR + manual) ───────────────────
+const PW_ROWS = ["PWE", "PWG", "ECMWF", "GFS"];
+function renderPwCard(v) {
+  const c = el("div", "card");
+  c.innerHTML = `<h2 class="section" style="margin-top:0">PredictWind models</h2>
+    <div class="hint" style="margin-bottom:12px">Scan a PredictWind screenshot or type the rows. OCR pre-fills — always check the numbers before saving. Saved as separate models so each gets its own trust score.</div>
+    <div class="row">
+      <label class="fld"><span class="lab">Date</span><input id="pw-date" type="date" value="${new Date().toISOString().slice(0,10)}"></label>
+      <label class="fld"><span class="lab">Spot</span><select id="pw-spot">${Object.entries(data.config.spots).map(([k,s])=>`<option value="${k}">${s.name}</option>`).join("")}</select></label>
+    </div>
+    <label class="fld"><span class="lab">PredictWind screenshot (optional)</span><input id="pw-img" type="file" accept="image/*"></label>
+    <div id="pw-ocr" class="hint" style="margin:6px 0"></div>
+    <table class="tbl pwgrid"><thead><tr><th>model</th><th>base</th><th>gust</th><th>dir</th></tr></thead>
+      <tbody>${PW_ROWS.map((m,i)=>`<tr>
+        <td><input class="pw-m" data-i="${i}" value="${m}" style="width:72px"></td>
+        <td><input class="pw-b num" data-i="${i}" type="number" inputmode="decimal" step="0.5" placeholder="m/s" style="width:60px"></td>
+        <td><input class="pw-g num" data-i="${i}" type="number" inputmode="decimal" step="0.5" placeholder="m/s" style="width:60px"></td>
+        <td><input class="pw-d" data-i="${i}" value="S" style="width:56px"></td></tr>`).join("")}</tbody></table>
+    <button class="btn sm" id="pw-save" style="margin-top:12px">Save PredictWind rows</button>`;
+  v.appendChild(c);
+
+  $("#pw-img").onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const status = $("#pw-ocr");
+    status.textContent = "Loading OCR engine…";
+    try {
+      const text = await recognize(f, (p) => { status.textContent = `Reading screenshot… ${Math.round(p*100)}%`; });
+      const labels = [...document.querySelectorAll(".pw-m")].map((i) => i.value);
+      const parsed = parsePredictWind(text, labels);
+      let filled = 0;
+      labels.forEach((label, i) => {
+        const p = parsed[label]; if (!p) return;
+        if (p.base_ms !== "") { document.querySelector(`.pw-b[data-i="${i}"]`).value = p.base_ms; filled++; }
+        if (p.gust_ms !== "") document.querySelector(`.pw-g[data-i="${i}"]`).value = p.gust_ms;
+        if (p.dir) document.querySelector(`.pw-d[data-i="${i}"]`).value = p.dir;
+      });
+      status.innerHTML = filled
+        ? `Pre-filled ${filled} model${filled>1?"s":""} — <b style="color:var(--warn)">check the numbers</b>, then save.`
+        : `Couldn't read the table cleanly — type the rows by hand below.`;
+    } catch (err) {
+      status.textContent = `OCR failed (${err.message}). Type the rows by hand.`;
+    }
+  };
+
+  $("#pw-save").onclick = () => {
+    const sid = store.sessionId($("#pw-date").value, $("#pw-spot").value);
+    const labels = [...document.querySelectorAll(".pw-m")].map((i) => i.value.trim());
+    let saved = 0;
+    labels.forEach((label, i) => {
+      if (!label) return;
+      const b = document.querySelector(`.pw-b[data-i="${i}"]`).value;
+      const g = document.querySelector(`.pw-g[data-i="${i}"]`).value;
+      const d = document.querySelector(`.pw-d[data-i="${i}"]`).value;
+      if (b === "" && g === "") return;     // skip blank rows
+      store.upsertForecast(data, { session_id: sid, model: label, base_ms: b, gust_ms: g,
+        dir: d, captured_at: new Date().toISOString().slice(0,16), source: "predictwind" });
+      saved++;
+    });
+    if (!saved) return toast("Fill at least one row");
+    toast(`Saved ${saved} PredictWind model${saved>1?"s":""}`); renderData();
+  };
 }
 
 // ── DATA ──────────────────────────────────────────────
@@ -278,6 +650,7 @@ function renderData() {
     store.upsertForecast(data, { session_id: sid, model, base_ms: $("#f-base").value, gust_ms: $("#f-gust").value, dir: $("#f-dir").value, captured_at: new Date().toISOString().slice(0,16), source: "manual" });
     toast(`Forecast ${model} saved`); renderData();
   };
+  renderPwCard(v);
   const sc = el("div", "card");
   sc.innerHTML = `<h2 class="section" style="margin-top:0">Logged data</h2>
     <div class="hint" style="margin-bottom:10px">${data.sessions.length} sessions · ${data.forecasts.length} forecasts · ${data.observations.length} observations</div>`;
@@ -292,15 +665,23 @@ function renderData() {
   sc.onclick = (e) => { const b = e.target.closest("[data-del]"); if (!b) return; store.deleteSession(data, +b.dataset.del); renderData(); toast("Deleted"); };
   v.appendChild(sc);
   const bc = el("div", "card");
+  const last = store.lastExport();
+  const ageDays = last ? Math.floor((Date.now() - Date.parse(last)) / 864e5) : null;
+  const stale = ageDays == null || ageDays >= 14;
+  const backupNote = last
+    ? `Last backup ${ageDays === 0 ? "today" : ageDays + " day" + (ageDays > 1 ? "s" : "") + " ago"}.`
+    : "No backup yet.";
   bc.innerHTML = `<h2 class="section" style="margin-top:0">Backup & sync</h2>
-    <div class="hint" style="margin-bottom:12px">Everything lives in this browser. Export a JSON to commit into your repo, or CSVs for the Python tools.</div>
+    <div class="${stale ? "warnbox" : "hint"}" style="margin-bottom:12px">${stale ? "⚠︎ " : ""}${backupNote} Everything lives in this browser — export a JSON now and then (save it to Files/iCloud or commit it to the repo). Save it to the same place each time so it's easy.</div>
     <div class="btn-row"><button class="btn sm ghost" id="d-json">Export JSON</button><button class="btn sm ghost" id="d-import">Import JSON</button></div>
     <div class="btn-row"><button class="btn sm ghost" id="d-csv-s">sessions.csv</button><button class="btn sm ghost" id="d-csv-f">forecasts.csv</button><button class="btn sm ghost" id="d-csv-o">obs.csv</button></div>
     <input id="d-file" type="file" accept=".json" style="display:none">
     <div class="divider"></div>
+    ${store.hasSnapshot() ? `<div class="btn-row"><button class="btn sm ghost" id="d-undo" style="color:var(--good)">↩ Undo last wipe/reset</button></div>` : ""}
     <div class="btn-row"><button class="btn sm ghost" id="d-reset" style="color:var(--warn)">Reset to seed</button><button class="btn sm ghost" id="d-wipe" style="color:var(--bad)">Wipe all</button></div>`;
   v.appendChild(bc);
-  $("#d-json").onclick = () => store.download(store.exportJSON(data), "windlog-backup.json");
+  if (store.hasSnapshot()) $("#d-undo").onclick = () => { data = store.restoreSnapshot(); renderAll(); toast("Restored"); };
+  $("#d-json").onclick = () => { store.download(store.exportJSON(data), "windlog-backup.json"); store.markExported(); renderData(); };
   $("#d-csv-s").onclick = () => store.download(store.exportCSV(data, "sessions"), "sessions.csv");
   $("#d-csv-f").onclick = () => store.download(store.exportCSV(data, "forecasts"), "forecasts.csv");
   $("#d-csv-o").onclick = () => store.download(store.exportCSV(data, "observations"), "observations.csv");

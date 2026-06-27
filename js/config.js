@@ -7,10 +7,11 @@ export const DEFAULT_CONFIG = {
     dad:  { name: "Dad",  weight_kg: 100, planing_floor_kt: 14 },
   },
   boards: [
-    { id: "carve169", name: "Starboard Carve 2024", litres: 169, owner: "dad" },
-    { id: "b145",     name: "145",                   litres: 145, owner: "joel" },
-    { id: "rrd",      name: "RRD Evolution",          litres: 125, owner: "joel" },
-    { id: "hawaii",   name: "Hawaii",                 litres: 115, owner: "joel" },
+    { id: "mistral",  name: "Old Mistral",            litres: 180, owner: "shared", note: "old big board, ~170–190L — light-wind / learner floater" },
+    { id: "carve169", name: "Starboard Carve 2024",   litres: 169, owner: "dad" },
+    { id: "b145",     name: "145",                     litres: 145, owner: "joel" },
+    { id: "rrd",      name: "RRD Evolution",           litres: 125, owner: "joel" },
+    { id: "hawaii",   name: "Hawaii",                  litres: 115, owner: "joel" },
   ],
   sails: [7.8, 7.5, 6.9, 6.0, 5.9, 5.5],
   spots: {

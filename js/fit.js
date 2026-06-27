@@ -42,10 +42,15 @@ export async function parseFit(arrayBuffer, planingKt = 12) {
     includeUnknownData: false, mergeHeartRates: false,
   });
   const records = messages.recordMesgs || [];
-  const speeds = [], times = [];
+  const speeds = [], times = [], lats = [], lons = [];
+  // FIT stores position in semicircles; convert to degrees.
+  const SC = 180 / 2 ** 31;
   for (const r of records) {
     const v = r.enhancedSpeed != null ? r.enhancedSpeed : r.speed;
     if (v != null) { speeds.push(v); times.push(r.timestamp ? new Date(r.timestamp).getTime() : null); }
+    if (r.positionLat != null && r.positionLong != null) {
+      lats.push(r.positionLat * SC); lons.push(r.positionLong * SC);
+    }
   }
   const clean = times.filter((t) => t != null);
   let dt = 1, startMs = null, endMs = null;
@@ -54,5 +59,7 @@ export async function parseFit(arrayBuffer, planingKt = 12) {
     const span = (endMs - startMs) / 1000;
     if (span > 0) dt = span / (clean.length - 1);
   }
-  return { ...summarise(speeds, dt, planingKt), startMs, endMs };
+  // median position is robust to the odd GPS spike
+  const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+  return { ...summarise(speeds, dt, planingKt), startMs, endMs, lat: median(lats), lon: median(lons) };
 }

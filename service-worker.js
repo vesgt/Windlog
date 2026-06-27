@@ -1,10 +1,11 @@
 // service-worker.js — offline app shell. App logic + your logged data work
 // offline (data is in localStorage). FIT parsing and SMHI need the network.
-const CACHE = "windlog-v1";
+const CACHE = "windlog-v2";
 const SHELL = [
   "./", "./index.html", "./app.css",
   "./js/app.js", "./js/engine.js", "./js/store.js",
   "./js/config.js", "./js/fit.js", "./js/smhi.js",
+  "./js/forecast.js", "./js/ocr.js",
   "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-180.png",
 ];
