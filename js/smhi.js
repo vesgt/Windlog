@@ -1,10 +1,12 @@
-// smhi.js — fetch measured wind from the nearest SMHI station, in-browser.
-// SMHI Open Data is free and keyless. If the browser blocks the request
-// (CORS) or you're offline, the Log form lets you type the measured wind by
-// hand instead — the analysis treats both identically.
+// smhi.js — fetch measured wind from the nearest SMHI station for the EXACT
+// window you sailed. Pass the session's start/end (from the FIT, or manual
+// times); base = mean over the window, gust = max over the window, dir =
+// nearest the midpoint. Picks the right archive period by how old the session
+// is. CORS-blocked or offline → enter wind by hand; analysis treats both the same.
 
 const API = "https://opendata-download-metobs.smhi.se/api/version/1.0";
 const DIRS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const HOUR = 3600e3;
 
 export function degToCompass(deg) {
   if (deg == null) return "";
@@ -35,7 +37,15 @@ export async function nearestStation(lat, lon, parameter = 4) {
   return best ? { id: best.id, name: best.name, km: bestD } : null;
 }
 
-async function paramSeries(stationId, parameter, period = "latest-day") {
+// choose the archive period that will contain the session time
+function periodFor(midMs) {
+  const ageH = (Date.now() - midMs) / HOUR;
+  if (ageH <= 22) return "latest-day";       // last 24h of values
+  if (ageH <= 24 * 110) return "latest-months"; // ~4 months
+  return "corrected-archive";                 // older
+}
+
+async function paramSeries(stationId, parameter, period) {
   try {
     const data = await getJSON(`${API}/parameter/${parameter}/station/${stationId}/period/${period}/data.json`);
     return (data.value || []).map((v) => ({ t: +v.date, val: parseFloat(v.value) }))
@@ -43,23 +53,38 @@ async function paramSeries(stationId, parameter, period = "latest-day") {
   } catch { return []; }
 }
 
-const nearestVal = (series, whenMs) =>
-  series.length ? series.reduce((a, b) => (Math.abs(b.t - whenMs) < Math.abs(a.t - whenMs) ? b : a)).val : null;
+const nearestVal = (s, t) => s.length ? s.reduce((a, b) => (Math.abs(b.t - t) < Math.abs(a.t - t) ? b : a)).val : null;
+const inWindow = (s, a, b) => s.filter((x) => x.t >= a && x.t <= b);
+const meanOf = (s) => (s.length ? s.reduce((m, x) => m + x.val, 0) / s.length : null);
+const maxOf = (s) => (s.length ? Math.max(...s.map((x) => x.val)) : null);
 
-// Returns { station_id, station_name, obs_base_ms, obs_gust_ms, obs_dir }
-export async function fetchObservation(lat, lon, whenMs = Date.now()) {
+// startMs/endMs define the session window. If only one time is known, a ±45min
+// window is used around it. whenMs is the midpoint used for period + direction.
+export async function fetchObservation(lat, lon, { startMs, endMs } = {}) {
   const st = await nearestStation(lat, lon);
   if (!st) throw new Error("No SMHI station found");
+
+  let a = startMs, b = endMs;
+  if (a == null && b == null) { b = Date.now(); a = b; }
+  if (a == null) a = b; if (b == null) b = a;
+  if (a === b) { a -= 45 * 60e3; b += 45 * 60e3; }       // pad a point into a window
+  const mid = (a + b) / 2;
+  const period = periodFor(mid);
+
   const [speed, dir, gust] = await Promise.all([
-    paramSeries(st.id, 4), paramSeries(st.id, 3), paramSeries(st.id, 21),
+    paramSeries(st.id, 4, period), paramSeries(st.id, 3, period), paramSeries(st.id, 21, period),
   ]);
-  const base = nearestVal(speed, whenMs);
-  const dirv = nearestVal(dir, whenMs);
-  const gmax = gust.length ? Math.max(...gust.map((x) => x.val)) : null;
+
+  // window first, fall back to nearest-the-midpoint if the window is empty
+  const sWin = inWindow(speed, a, b), gWin = inWindow(gust, a, b);
+  const base = sWin.length ? meanOf(sWin) : nearestVal(speed, mid);
+  const gmax = gWin.length ? maxOf(gWin) : nearestVal(gust, mid);
+  const dirv = nearestVal(dir, mid);
+
   const r1 = (x) => (x == null ? "" : Math.round(x * 10) / 10);
   return {
-    station_id: st.id, station_name: st.name,
+    station_id: st.id, station_name: st.name, km: Math.round(st.km),
     obs_base_ms: r1(base), obs_gust_ms: r1(gmax), obs_dir: degToCompass(dirv),
-    km: Math.round(st.km),
+    window: { from: a, to: b, period, n_samples: sWin.length },
   };
 }

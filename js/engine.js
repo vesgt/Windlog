@@ -1,10 +1,7 @@
-// engine.js — gear recommender + reliability/threshold analysis.
-// Pure functions, no DOM, no storage. Ported 1:1 from the Python scripts
-// so results match.
+// engine.js — gear recommender + reliability/threshold analysis + automatic
+// session assessment. Pure functions, no DOM, no storage.
 
 export const MS_TO_KT = 1.943844;
-
-const DIR_ORDER = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
 
 // ── gear selection ────────────────────────────────────────────────
 export function joelKit(base, gust) {
@@ -27,16 +24,65 @@ export function dadKit(base, gust) {
   return ["b145", 5.5, "strong-wind setup"];
 }
 
-// over/under-powered read, calibrated to the seeded bands
+// ideal centre wind (kt) for a sail at a given rider weight — shared by the
+// power read and the automatic assessment so they agree.
+export function idealCentreKt(sail, weight) {
+  return (49 - 4.67 * sail) * Math.sqrt(weight / 75);
+}
+
 export function powerNote(base, gust, sail, weight) {
   const baseKt = base * MS_TO_KT, gustKt = gust * MS_TO_KT;
-  const ideal = (49 - 4.67 * sail) * Math.sqrt(weight / 75);
+  const ideal = idealCentreKt(sail, weight);
   if (baseKt < ideal - 4) {
     if (gustKt >= ideal - 1) return "marginal — powered only in gusts";
     return "under-powered";
   }
   if (baseKt > ideal + 5) return "overpowered up top — sheet out / size down";
   return "nicely matched";
+}
+
+// ── automatic session assessment ──────────────────────────────────
+// Decides whether you actually planed and whether the sail was a good call,
+// from the planing ratio (FIT) cross-checked against measured wind. No self-
+// assessment. Returns { planed:'y'|'n', powered:'under'|'ideal'|'over',
+//   label, ratioPct }.  Any input may be null; it does the best it can.
+export function assessSession({ planingRatio, baseKt, gustKt, sail, weight }) {
+  const ideal = (baseKt != null && sail) ? idealCentreKt(sail, weight) : null;
+  const pct = planingRatio != null ? Math.round(planingRatio * 100) : null;
+
+  // No FIT ratio: fall back to a wind-vs-gear expectation, planed unknown.
+  if (planingRatio == null) {
+    if (baseKt == null) return { planed: "", powered: "", label: "no data to assess — add a FIT or measured wind", ratioPct: null };
+    let powered = "ideal";
+    if (baseKt < ideal - 4) powered = (gustKt != null && gustKt >= ideal - 1) ? "under" : "under";
+    else if (baseKt > ideal + 5) powered = "over";
+    const exp = powered === "ideal" ? "wind suited the sail" : powered === "over" ? "likely overpowered for the sail" : "likely underpowered/under-winded";
+    return { planed: "", powered, label: `${exp} (from wind only — no FIT)`, ratioPct: null };
+  }
+
+  const planed = planingRatio >= 0.1 ? "y" : "n";
+
+  if (planingRatio >= 0.6) {
+    // planed most of the time → good call, unless gusts ran well over range
+    if (ideal != null && gustKt != null && gustKt > ideal + 12) {
+      return { planed, powered: "over", ratioPct: pct,
+        label: `overpowered — planing ${pct}% but gusts ran well over the sail's range; size down next time` };
+    }
+    return { planed, powered: "ideal", ratioPct: pct, label: `good call — planing ${pct}% of the time` };
+  }
+
+  if (planingRatio >= 0.25) {
+    const lulls = (ideal != null && baseKt < ideal - 4) ? ", and the wind was light" : "; sized a touch small for the lulls — size up";
+    return { planed, powered: "under", ratioPct: pct, label: `marginal — planing only ${pct}%${lulls}` };
+  }
+
+  // barely planed
+  if (ideal != null && baseKt < ideal - 4) {
+    return { planed, powered: "under", ratioPct: pct,
+      label: `under-winded — planing ${pct}%, base only ${Math.round(baseKt)} kt; not the gear's fault` };
+  }
+  return { planed, powered: "under", ratioPct: pct,
+    label: `underpowered — planing ${pct}% despite ${baseKt != null ? Math.round(baseKt) + " kt base" : "usable wind"}; size up` };
 }
 
 export function pickSpots(dir, spots) {
@@ -49,14 +95,13 @@ export function boardName(boards, id) {
   return b ? `${b.name} (${b.litres}L)` : id;
 }
 
-// full recommendation object for the Today tab
-export function recommend(base, gust, dir, config, learnedFloors = {}) {
+export function recommend(base, gust, dir, config, learnedF = {}) {
   const out = { base, gust, dir: dir.toUpperCase(), baseKt: base * MS_TO_KT, gustKt: gust * MS_TO_KT, sailors: [], spots: [] };
   for (const [who, fn] of [["joel", joelKit], ["dad", dadKit]]) {
     const s = config.sailors[who];
     const [bid, sail, note] = fn(base, gust);
     const pn = powerNote(base, gust, sail, s.weight_kg);
-    const floor = learnedFloors[who];
+    const floor = learnedF[who];
     let verdict = null;
     if (floor != null) verdict = out.baseKt >= floor ? "planing" : "marginal / gust-dependent";
     out.sailors.push({ who, name: s.name, weight: s.weight_kg,
@@ -73,7 +118,7 @@ const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
 
 export function modelReliability(forecasts, observations) {
   const obs = Object.fromEntries(observations.map((o) => [o.session_id, o]));
-  const err = {}; // key: spot|model -> {base:[],gust:[]}
+  const err = {};
   for (const r of forecasts) {
     const o = obs[r.session_id];
     if (!o) continue;
@@ -89,15 +134,12 @@ export function modelReliability(forecasts, observations) {
     const [spot, model] = key.split("|");
     const bMAE = mean(e.base.map(Math.abs)), gMAE = mean(e.gust.map(Math.abs));
     (bySpot[spot] ||= []).push({
-      model,
-      baseBias: mean(e.base), baseMAE: bMAE,
-      gustBias: mean(e.gust), gustMAE: gMAE,
-      n: Math.max(e.base.length, e.gust.length),
-      score: (bMAE ?? 9) + (gMAE ?? 9),
+      model, baseBias: mean(e.base), baseMAE: bMAE, gustBias: mean(e.gust), gustMAE: gMAE,
+      n: Math.max(e.base.length, e.gust.length), score: (bMAE ?? 9) + (gMAE ?? 9),
     });
   }
   for (const spot of Object.keys(bySpot)) bySpot[spot].sort((a, b) => a.score - b.score);
-  return bySpot; // { spot: [ {model, ...} sorted best-first ] }
+  return bySpot;
 }
 
 export function planingThresholds(sessions, observations) {
@@ -115,16 +157,13 @@ export function planingThresholds(sessions, observations) {
     const [sailor, board, sail] = key.split("|");
     const planedWinds = recs.filter((x) => x.planed === "y" && x.baseKt != null).map((x) => x.baseKt);
     const maxes = recs.map((x) => x.max).filter((x) => x != null);
-    return {
-      sailor, board, sail, n: recs.length,
+    return { sailor, board, sail, n: recs.length,
       floor_kt: planedWinds.length ? Math.min(...planedWinds) : null,
       best_kt: maxes.length ? Math.max(...maxes) : null,
-      feels: [...new Set(recs.map((x) => x.powered).filter(Boolean))],
-    };
+      feels: [...new Set(recs.map((x) => x.powered).filter(Boolean))] };
   });
 }
 
-// learned floors for the recommender: lowest measured base each sailor planed at
 export function learnedFloors(sessions, observations) {
   const obs = Object.fromEntries(observations.map((o) => [o.session_id, o]));
   const out = {};

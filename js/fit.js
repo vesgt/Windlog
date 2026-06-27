@@ -1,7 +1,8 @@
 // fit.js — parse a Garmin .fit in the browser using the official Garmin
-// FIT SDK loaded from jsdelivr (ESM). Returns max speed (kt) + planing minutes.
-// Needs connectivity the first time (CDN). Falls back gracefully if offline:
-// the Log form still accepts a manually typed max speed.
+// FIT SDK from jsdelivr (ESM). Returns max speed, planing minutes, the
+// planing RATIO (share of moving time actually on plane), and the real
+// session start/end timestamps so wind can be pulled for the exact window.
+// Needs connectivity the first time (CDN). Offline → type max speed by hand.
 
 const MS_TO_KT = 1.943844;
 const SPIKE_KT = 45;
@@ -13,25 +14,28 @@ async function sdk() {
   return _sdk;
 }
 
-export function summarise(speedsMs, dtS = 1, planingKt = 12, movingKt = 2) {
+// planingKt = boardspeed at which these boards are up and planing (~12 kt).
+// movingKt   = above this you're sailing, not drifting; used as the denominator
+//              so schlogging/floating time doesn't distort the ratio. The
+//              lowest GPS speed (e.g. 2.7 kt) is never treated as meaningful.
+export function summarise(speedsMs, dtS = 1, planingKt = 12, movingKt = 4) {
   const kt = speedsMs.filter((s) => s != null).map((s) => s * MS_TO_KT).filter((s) => s >= 0 && s < SPIKE_KT);
-  if (!kt.length) return { max_speed_kt: 0, avg_moving_kt: 0, mins_planing: 0, mins_moving: 0, samples: 0 };
-  const moving = kt.filter((s) => s >= movingKt);
-  const planing = kt.filter((s) => s >= planingKt);
+  if (!kt.length) return { max_speed_kt: 0, mins_planing: 0, mins_moving: 0, planing_ratio: null, samples: 0 };
+  const movingN = kt.filter((s) => s >= movingKt).length;
+  const planingN = kt.filter((s) => s >= planingKt).length;
   const round1 = (x) => Math.round(x * 10) / 10;
   return {
     max_speed_kt: round1(Math.max(...kt)),
-    avg_moving_kt: moving.length ? round1(moving.reduce((a, b) => a + b, 0) / moving.length) : 0,
-    mins_planing: round1((planing.length * dtS) / 60),
-    mins_moving: round1((moving.length * dtS) / 60),
+    mins_planing: round1((planingN * dtS) / 60),
+    mins_moving: round1((movingN * dtS) / 60),
+    planing_ratio: movingN ? Math.round((planingN / movingN) * 100) / 100 : null,
     samples: kt.length,
   };
 }
 
 export async function parseFit(arrayBuffer, planingKt = 12) {
   const { Decoder, Stream } = await sdk();
-  const stream = Stream.fromArrayBuffer(arrayBuffer);
-  const decoder = new Decoder(stream);
+  const decoder = new Decoder(Stream.fromArrayBuffer(arrayBuffer));
   if (!decoder.isFIT()) throw new Error("Not a FIT file");
   const { messages } = decoder.read({
     convertTypesToStrings: true, convertDateTimesToDates: true,
@@ -43,11 +47,12 @@ export async function parseFit(arrayBuffer, planingKt = 12) {
     const v = r.enhancedSpeed != null ? r.enhancedSpeed : r.speed;
     if (v != null) { speeds.push(v); times.push(r.timestamp ? new Date(r.timestamp).getTime() : null); }
   }
-  let dt = 1;
   const clean = times.filter((t) => t != null);
+  let dt = 1, startMs = null, endMs = null;
   if (clean.length >= 2) {
-    const span = (clean[clean.length - 1] - clean[0]) / 1000;
+    startMs = clean[0]; endMs = clean[clean.length - 1];
+    const span = (endMs - startMs) / 1000;
     if (span > 0) dt = span / (clean.length - 1);
   }
-  return summarise(speeds, dt, planingKt);
+  return { ...summarise(speeds, dt, planingKt), startMs, endMs };
 }
